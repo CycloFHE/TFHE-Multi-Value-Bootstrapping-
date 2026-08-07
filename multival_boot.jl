@@ -1,16 +1,32 @@
 #=============================================================================
- multival_boot.jl  --  SELF-CONTAINED multi-value / LUT bootstrap.
+ multival_boot_bis.jl  --  SELF-CONTAINED multi-value / LUT bootstrap, in the
+ variant where the final LWE ciphertext is obtained through the CLOSED-FORM
+ extraction formulas of Proposition 7 (and its dual Remark 6) of [CKL25],
+ derived once and for all, instead of forming the trace explicitly.
 
- Standalone  (no include, no external packages): the general prime-power cyclotomic refresh
- engine, the standard (SVM) bootstrap, and the multi-value/LUT (MVM) bootstrap
- with its optimal factorisation, in one file.
+ Difference with multival_boot.jl -- the (MVM) mode:
+   multival_boot.jl : blind-rotate w  ->  external product by RGSW*(V_f*)
+                      (ell gadget products = 4*ell FFT convolutions)  ->  trace.
+   this file        : blind-rotate w  ->  ONE closed-form extraction that already
+                      carries V_f*. No RGSW*(V_f*) key, no external product.
 
- Pure Base Julia + stdlib only (Random, Statistics, Printf, Base.Threads);
- hand-rolled radix-2 FFT, deterministic threaded Monte-Carlo.
+ This is legitimate because Tr(X^{-i} v_f*) = <Vbar_f*, X^{-i} w> is a LINEAR
+ functional of the accumulator, so V_f* can be folded into the extraction:
 
- RUN:  julia -t auto multival_boot.jl        # selftest_basis() + run_compare()
- Entry points: standboot, lutboot, lut_key, run_compare, run_compare_secure,
- selftest_basis, and diagnostics debug_slots / test_composite / test_star.
+   (SVM, dual acc)   b^   = b*_0
+                     a^_j = a*_{-j} - [1<=j<=m] P_{m-j},  P_s = sum_{r=s mod m} a*_r
+   (MVM, primal acc) b^   = sum_i F_i b_{i m}     - S b_N
+                     a^_j = sum_i F_i a_{i m - j} - S a_{N-j},   S = sum_i F_i,
+
+ all indices mod M and F_i = p f(i/p). It is also exactly the model underlying
+ the paper's error estimate, in which E_2 = <Vbar_f*, Err(c)>.
+
+ Cost, per function and after the shared rotation: O(N p) scalar operations
+ instead of 4*ell convolutions of length ~4M.
+
+ Pure Base Julia + stdlib only (Random, Statistics, Printf, Base.Threads).
+
+ RUN:  julia -t auto multival_boot_bis.jl     # selftest_bis() + run_compare_bis()
 =============================================================================#
 
 using Random, Statistics, Printf, Base.Threads
@@ -928,7 +944,160 @@ function run_compare_secure(; p = 11, bits = 128, mc = 1, Dlog = 8, ell = 3,
     println("  s(E2)/s(E1) should match the 'pred' column = sqrt( (sum_i F_i^2)/2 ) (eq:varE2).")
 end
 
+# =============================================================================
+#  PROPOSITION-7 EXTRACTION  (the point of this variant)
+# =============================================================================
+
+"Index tables for the (SVM) dual extraction (Prop. 7 / Remark 6 of [CKL25])."
+struct SVMPlan
+    idx::Vector{Int}
+    cor::Vector{Int}
+end
+SVMPlan(c::Cfg) = SVMPlan([mod(c.M - j, c.M) + 1 for j in 0:c.N-1],
+                          [(1 <= j <= c.m) ? (c.m - j + 1) : 0 for j in 0:c.N-1])
+
+"Plaintext data for the (MVM) generalised extraction <Vbar_f*, .>. Note that it
+ contains NO ciphertext: the per-function key RGSW*(V_f*) is not needed at all."
+struct MVMPlan
+    F::Vector{Float64}
+    S::Float64
+    off::Vector{Int}
+    c0::Float64
+end
+function MVMPlan(c::Cfg, fvals::Vector{Float64})
+    c0 = sum(fvals)/length(fvals)
+    F  = [c.t*(fvals[i+1] - c0) for i in 0:c.t-2]
+    nonint = maximum(abs.(F .- round.(F)))
+    nonint > 1e-9 && @warn @sprintf(
+        "MVMPlan: V_f* NON-INTEGRAL (max frac %.3g); MVM exact only for outputs on the 1/p grid.", nonint)
+    MVMPlan(F, sum(F), [-i*c.m for i in 0:c.t-2], c0)
+end
+
+"(SVM) LWE of the trace (dual coordinate 0) of the RLWE* accumulator."
+function extract_svm(c::Cfg, pl::SVMPlan, accA::Vector{Float64}, accB::Vector{Float64})
+    P = psums(c, accA); ah = Vector{Float64}(undef, c.n)
+    @inbounds for j in 1:c.N
+        v = accA[pl.idx[j]]
+        pl.cor[j] != 0 && (v -= P[pl.cor[j]])
+        ah[j] = v
+    end
+    ah, mod1c(accB[1])
+end
+
+"(MVM) LWE of <Vbar_f*, acc> straight from the non-dual accumulator."
+function extract_mvm(c::Cfg, pl::MVMPlan, accA::Vector{Float64}, accB::Vector{Float64})
+    M, m = c.M, c.m
+    ah = zeros(Float64, c.n)
+    @inbounds for j in 0:c.N-1
+        acc = 0.0
+        for i in eachindex(pl.F)
+            Fi = pl.F[i]
+            Fi == 0.0 && continue
+            acc += Fi * accA[mod(pl.off[i] - j, M) + 1]      # off[i] = -i*m
+        end
+        ah[j+1] = acc - pl.S * accA[mod(m - j, M) + 1]
+    end
+    bh = 0.0
+    @inbounds for i in eachindex(pl.F)
+        bh += pl.F[i] * accB[mod(pl.off[i], M) + 1]
+    end
+    bh -= pl.S * accB[mod(m, M) + 1]
+    ah, mod1c(bh)
+end
+
+"(SVM) standard bootstrap with the closed-form extraction."
+function standboot_bis(c::Cfg, a, b::Float64, s, BK, fvals::Vector{Float64},
+                       pl::SVMPlan = SVMPlan(c))
+    c0 = sum(fvals)/length(fvals)
+    accA, accB = blindrot(c, a, b, s, BK, testpoly_f(c, fvals .- c0))
+    ah, bh = extract_svm(c, pl, accA, accB)
+    ah, mod1c(bh + c0)
+end
+
+"(MVM) multi-value bootstrap: one shared rotation of w, then the generalised
+ extraction. No RGSW*(V_f*) and no external product."
+function lutboot_bis(c::Cfg, a, b::Float64, s, BK, mk::MVMPlan)
+    accA, accB = blindrot_nd(c, a, b, s, BK, make_w(c))
+    ah, bh = extract_mvm(c, mk, accA, accB)
+    ah, mod1c(bh + mk.c0)
+end
+
+# =============================================================================
+#  Self-tests and comparison
+# =============================================================================
+
+"Noise-free per-slot check: both closed-form modes must decode f exactly, and
+ agree with the reference standboot / lutboot of multival_boot.jl."
+function selftest_bis(; p = 5, bits = 80, mc = 2, Dlog = 15, ell = 2, func = :sign)
+    c = make(p, p, alpha_for(p, bits), mc, 0.0; sig_bk = 2.0^-52, Dlog = Dlog, ell = ell)
+    setup = Xoshiro(11); s, sT = keygen(c, setup)
+    BK = bootstrap_keys(c, WS(c), s, sT, c.sig_bk, setup)
+    fvals = make_fvals(func, c.t)
+    pl = SVMPlan(c); mk = MVMPlan(c, fvals); RG, c0 = lut_key(c, sT, fvals, setup)
+    okA = okB = okC = true
+    @printf("selftest_bis (p=%d, M=%d, N=%d, f=%s)\n", p, c.M, c.N, func)
+    @printf("%4s %10s %12s %12s %12s\n", "i0", "target", "SVM_bis", "MVM_bis", "MVM_ref")
+    for i0 in 0:c.t-1
+        mu = mods(i0, c.t)/c.t; tgt = fvals[i0+1]
+        a, b = lwe_enc(c, mu, s, 0.0, setup)
+        v1 = mod1c(lwe_phase(standboot_bis(c,a,b,s,BK,fvals,pl)..., s))
+        v2 = mod1c(lwe_phase(lutboot_bis(c,a,b,s,BK,mk)..., s))
+        v3 = mod1c(lwe_phase(lutboot(c,a,b,s,BK,RG,c0)..., s))
+        abs(mod1c(v1-tgt)) < 1e-3 || (okA = false)
+        abs(mod1c(v2-tgt)) < 1e-3 || (okB = false)
+        abs(mod1c(v2-v3))  < 1e-3 || (okC = false)
+        @printf("%4d %+10.4f %+12.4f %+12.4f %+12.4f\n", i0, tgt, v1, v2, v3)
+    end
+    @printf("SVM_bis exact = %s   MVM_bis exact = %s   MVM_bis == MVM_ref = %s\n",
+            okA ? "OK" : "BUG", okB ? "OK" : "BUG", okC ? "OK" : "BUG")
+    okA && okB
+end
+
+"Per-function cost after the shared rotation: Prop.-7 extraction vs RGSW* product."
+function bench_bis(; p = 11, bits = 128, mc = 1, Dlog = 8, ell = 3, K = 20)
+    c = make(p, p, alpha_for(p, bits), mc, 0.0; sig_bk = 2.0^-30, Dlog = Dlog, ell = ell)
+    setup = Xoshiro(7); s, sT = keygen(c, setup)
+    BK = bootstrap_keys(c, WS(c), s, sT, c.sig_bk, setup)
+    fvals = make_fvals(:sign, c.t)
+    mk = MVMPlan(c, fvals); RG, c0 = lut_key(c, sT, fvals, setup)
+    a, b = lwe_enc(c, 0.0, s, 0.0, setup)
+    accA, accB = blindrot_nd(c, a, b, s, BK, make_w(c))
+    extract_mvm(c, mk, accA, accB); extprod_star(c, WS(c), RG, accA, accB)   # warm-up
+    t1 = @elapsed for _ in 1:K; extract_mvm(c, mk, accA, accB); end
+    t2 = @elapsed for _ in 1:K
+        a2, b2 = extprod_star(c, WS(c), RG, accA, accB); trace_extract(c, a2, b2)
+    end
+    @printf("per-function cost after the shared rotation (p=%d, M=%d, ell=%d, K=%d):\n", p, c.M, ell, K)
+    @printf("   Prop.7 extraction      : %8.3f ms\n", 1e3*t1/K)
+    @printf("   RGSW* product + extract: %8.3f ms   -> speed-up x%.1f\n", 1e3*t2/K, t2/t1)
+end
+
+"run_compare, Prop.-7 flavour: SVM_bis vs MVM_bis across functions."
+function run_compare_bis(; p = 5, bits = 80, mc = 2, Dlog = 15, ell = 2, sig_e = 0.0, K = 40)
+    c = make(p, p, alpha_for(p, bits), mc, sig_e; sig_bk = 2.0^-40, Dlog = Dlog, ell = ell)
+    setup = Xoshiro(11); s, sT = keygen(c, setup)
+    BK = bootstrap_keys(c, WS(c), s, sT, c.sig_bk, setup); pl = SVMPlan(c)
+    @printf("== SVM_bis vs MVM_bis (M=%d, N=%d, ~%d-bit), Prop.7 extraction ==\n", c.M, c.N, bits)
+    @printf("%-8s %7s %7s %12s %12s %10s\n","f","ok_svm","ok_mvm","s(E1)","s(E2)","s(E2)/s(E1)")
+    for name in (:id, :sign, :relu, :square, :cmp, :rand)
+        fvals = make_fvals(name, c.t); mk = MVMPlan(c, fvals)
+        e1 = Float64[]; e2 = Float64[]; o1 = 0; o2 = 0
+        for _ in 1:K
+            i0 = rand(setup, 0:c.t-1); mu = mods(i0,c.t)/c.t; tgt = fvals[i0+1]
+            a, b = lwe_enc(c, mu, s, c.sig_e, setup)
+            d1 = mod1c(lwe_phase(standboot_bis(c,a,b,s,BK,fvals,pl)..., s) - tgt)
+            d2 = mod1c(lwe_phase(lutboot_bis(c,a,b,s,BK,mk)..., s) - tgt)
+            push!(e1,d1); abs(d1) < 1/(2c.t) && (o1 += 1)
+            push!(e2,d2); abs(d2) < 1/(2c.t) && (o2 += 1)
+        end
+        s1, s2 = std(e1), std(e2)
+        @printf("%-8s %5d%% %5d%% %12.3e %12.3e %10.3f\n", name,
+                round(Int,100o1/K), round(Int,100o2/K), s1, s2, s2/s1)
+    end
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
-    selftest_basis()
-    run_compare()
+    selftest_bis()
+    println()
+    run_compare_bis()
 end
