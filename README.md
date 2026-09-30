@@ -168,7 +168,6 @@ argument and writes the `fig_mvm_*.pdf` into the current directory.
 
 ## A note on numbering
 
-The comments in both files refer to the section and table numbers of an earlier draft.
 Read "Section 5" for the numerical validation, now Section 6, and "Table 1" for the
 covariance table, now Table 2. The mathematical references — Lemma 3, Proposition 3,
 Corollary 1, Assumption 1 — match the paper as it stands.
