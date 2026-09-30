@@ -7,19 +7,8 @@
 #   MVM1     the multi-value mode with the canonical cofactor gamma = 1;
 #   MVMpiv   the multi-value mode with the pivot cofactor gamma = M Omega*_0.
 #
-# All three are coded in the PRIMAL: the accumulator is an element of
-# T = K/R held on the monomial basis, and multiplying the final accumulator by
-# Omega*_0 turns it into an RLWE*, which is how its error is inspected.  This is
-# a strict rewrite of the Python module mvm_boot.py: same objects, same tests,
-# same experiments.  The random streams of Julia and of numpy differ, so the
-# two agree statistically rather than draw by draw; the deterministic checks
-# (R0..R5, T1a) agree to machine precision.
 #
-# Nothing is reused from the other files of the project: the ring, the FHE
-# layer, the experiments, the tests and the figures are all here.
-#
-# Standard library only.  Two optional packages are used when present and cleanly
-# fallen back on when absent: FFTW, which is what makes ring degrees in the
+# Standard library only.  Two optional packages are used when present: FFTW, which is what makes ring degrees in the
 # thousands reachable, and Plots, without which the numbers are written as CSV.
 #
 # Usage -- the -t flag sets the number of threads, and the Monte-Carlo loops
@@ -60,26 +49,6 @@ catch
     false
 end
 
-# Parallelism, and at which level.  A blind rotation is strictly sequential --
-# each external product consumes the accumulator the previous one produced -- so
-# there is nothing to thread inside ONE rotation.  What is embarrassingly
-# parallel is the Monte-Carlo loop above it: the nb draws are independent
-# rotations, and that is where all the time is spent.  Threads.@threads is
-# therefore applied there (accumulator_errors, output_errors) and to the one-off
-# key transform (key_spectra), with one scratch Workspace per chunk.
-#
-# FFTW is left single-threaded, which deserves a word since the forward
-# transform IS a batch of 2*ell columns that FFTW would happily split.  Three
-# reasons the outer level wins: the transforms are some 75% of the work, so
-# threading them alone caps the speed-up near 3x (Amdahl); the BACKWARD batch is
-# only 2 columns wide and admits two threads at most; and the two levels cannot
-# be combined -- nthreads() outer times k inner oversubscribes the cores.  The
-# one regime where the inner level is the right answer is a single rotation done
-# for latency, with no outer loop to harvest; `fftw_threads!(k)` is there so the
-# question can be settled by measurement rather than by this comment.
-fftw_threads!(k::Int) = HAVE_FFTW ? FFTW.set_num_threads(k) : nothing
-fftw_threads!(1)
-
 # ============================================================== utilities ====
 
 "representative of x in [-1/2, 1/2)"
@@ -105,11 +74,6 @@ bases and the change-of-basis matrices used throughout.
   `toD`      = Gr(Omega) = real(V' V)  monomial coordinates -> dual coordinates
   `starD`    monomial coordinates of u -> dual coordinates of Omega*_0 u
 
-Products are computed cyclically: R is a quotient of Z[X]/(X^M - 1) and `fold`
-is the projection, so a product may be taken modulo X^M - 1 and folded
-afterwards.  In that representation X^k is a pointwise multiplier of the
-length-M DFT, which is what makes the CGGI increment (X^k - 1)RGSW(s_k) free
-and lets the whole external product be batched into one matrix product.
 M = p^alpha is odd and not a power of two.  With FFTW loaded the length-M
 transform is used directly -- M has only the small prime factor p, for which FFTW
 has codelets -- and `W`, `Wi` stay empty; without it they hold the dense DFT
@@ -173,11 +137,6 @@ dft(R::Ring, u)  = HAVE_FFTW ? fft(pad(R, u), 1)  : R.W  * pad(R, u)
 idft(R::Ring, U) = fold(R, real(HAVE_FFTW ? ifft(U, 1) : R.Wi * U))
 
 # --- half spectra -----------------------------------------------------------
-# Everything the external product transforms is REAL -- the digit rows and the
-# key rows -- so its length-M spectrum is conjugate-symmetric and the first
-# M/2+1 frequencies determine it.  Keeping only those halves both the transform
-# time and the size of the key spectra (236 MB instead of 472 at M = 2401,
-# n = 512, ell = 6).
 nfreq(R::Ring) = R.M ÷ 2 + 1
 
 rdft(R::Ring, u::AbstractVector{<:Real}) =
@@ -215,17 +174,10 @@ trnorm2s(R::Ring, u) = sum(abs2, R.Vs * u)          # ||u||_Tr^2, u on the DUAL 
 # They differ by which side of the pivot is spherical in the canonical embedding.
 #
 #   :spherical  tau(e*) spherical.  The key noise: every RLWE row is drawn as an
-#               RLWE* row.  G = sigma_c^2 Gr(Omega), that is 1 on the diagonal and
-#               -1/(p-1) on the whole band r = r' mod m; the amplification is
-#               ||B_f||_Tr / sqrt(N) with B_f = gamma V_f in R.
+#               RLWE* row.  
 #
 #   :rounding   tau(e) spherical, i.e. white on the M coefficients before the
-#               reduction modulo Phi_M.  This is what the arithmetic emits: the
-#               gadget residue and the floating-point error of the convolutions are
-#               both produced in the coefficients.  G is then proportional to
-#               Delta (x) I_m -- 1 on the diagonal, -1/2 at r'-r = +-m mod M, zero
-#               elsewhere -- and the amplification is ||B*_f||_Tr / ||Omega*_0||_Tr
-#               with B*_f = gamma V*_f in the dual.
+#               reduction modulo Phi_M.  
 #
 # The two share their three orbit MEANS, so the diagonal/band/other statistics do
 # not separate them; the Frobenius residual does.  The second is measured by
@@ -260,12 +212,6 @@ band_target(R::Ring, model::Symbol) = model === :spherical ? -1 / (R.p - 1) : -0
 default_sigbk(model::Symbol) = model === :rounding ? 0.0 : 2.0^-26
 
 # --- the N x N linear algebra of the ring, computed once --------------------
-# V, Vs and starD are N x N: at N = 2058 a product or a solve against them is
-# O(N^3), some seventy gigaflops and a hundred megabytes.  The experiments ask
-# for eleven of each -- five maps times two designs, plus (SVM) -- always on the
-# SAME ring, so recomputing them was the whole serial cost of a run.  They are
-# built on first use and kept, keyed by (p, alpha); the lock is there because
-# the parallel loops may reach this through their first call.
 const RCACHE = Dict{Tuple{Int,Int,Symbol},Any}()
 const RCLOCK = ReentrantLock()
 ringcache(R::Ring, what::Symbol, build) =
@@ -345,12 +291,7 @@ wfrak(R::Ring, gamma) = real(solveV(R, emb(R, wprimal(R)) ./ emb(R, gamma)))
 """
     Params(p, alpha; sig_e, sig_bk, Dlog, ell, n)
 
-`n` is the dimension of the INPUT LWE ciphertext, and it is deliberately
-decoupled from the ring degree N.  It has to be: the accumulator starts at
-(0, X^{a_0} v_0), whose mask is exactly zero, so the first external product
-emits less noise than the others by an amount that depends on how dense v_0 is
--- an O(1/n) bias, invisible at a cryptographic n, that would otherwise pollute
-the comparison between modes when n = N is small.
+`n` is the dimension of the INPUT LWE ciphertext.  
 """
 struct Params
     R::Ring; p::Int; alpha::Int; n::Int
@@ -414,7 +355,7 @@ end
 The n RGSW keys once and for all, indexed [frequency, block, level, component,
 key], on the M/2+1 kept frequencies.  The frequency comes first so that the
 accumulation loop of the external product walks memory contiguously.  The n keys
-are transformed in parallel -- they write disjoint slices of S.
+are transformed in parallel (they write disjoint slices of S).
 """
 function key_spectra(P::Params, BK)
     R = P.R
@@ -451,10 +392,7 @@ end
     decomp!(Dg, P, u, off)
 
 The same digits, written in place into the columns off+1 .. off+ell of `Dg`, one
-coefficient at a time.  The rotation calls this 2n times, so the allocation of
-`decomp` above -- five length-N temporaries per level -- is what would otherwise
-put the parallel loops in contention on the garbage collector.  `decomp` is kept
-as the readable reference and is what the naive external product uses.
+coefficient at a time.  
 """
 function decomp!(Dg::AbstractMatrix{Float64}, P::Params,
                  u::AbstractVector{<:Real}, off::Int)
@@ -475,9 +413,7 @@ end
 
 Scratch space for one blind rotation: the padded digit rows, their half
 spectrum, the accumulated product, the two real output rows, the multiplier of
-the current step, and the two FFTW plans.  A rotation is 2n transforms and some
-4n M-sized temporaries; holding them here removes that traffic entirely.  One
-workspace per thread -- never share one between two rotations running at once.
+the current step, and the two FFTW plans. One workspace per thread.
 """
 struct Workspace{PF, PB}
     Zc::Matrix{Float64}          # M x 2ell, the padded digit rows
@@ -502,14 +438,9 @@ end
 """
     ext_prod_core!(P, Ck, mult, acc1, acc2, ws)
 
-sum_t d_t . C_t with the key spectra `Ck` of shape (M/2+1, 2, ell, 2) and a
-pointwise multiplier `mult`, here the spectrum of X^k - 1.  One forward
-transform of the 2*ell digit rows and one inverse transform of the two
-components, instead of the 4*ell separate products of the naive route, and both
-on half spectra since every row transformed is real.
 
 The two components are left in `ws.Zr`, on the length-M monomial basis and
-already scaled: still to be folded modulo Phi_M.  Nothing is allocated.
+already scaled: still to be folded modulo Phi_M.  
 """
 function ext_prod_core!(P::Params, Ck, mult, acc1, acc2, ws::Workspace)
     R = P.R; h = nfreq(R)
@@ -544,9 +475,7 @@ end
 The step of the blind rotation: acc <- mod1(acc + product).  The reduction
 modulo Phi_M, the addition into the accumulator and the reduction modulo 1 are
 fused into a single pass over the N coefficients, so that the whole step
-allocates nothing at all -- the earlier route built some fifteen length-N
-temporaries per key, 213 MB per rotation, which the garbage collector then had
-to chase while every thread was doing the same.
+allocates nothing at all.
 """
 function ext_prod_add!(P::Params, Ck, mult, acc1, acc2, ws::Workspace)
     R = P.R
@@ -618,9 +547,7 @@ function extract_coeffs(R::Ring, U::AbstractVector{<:Real})
     T = zeros(ComplexF64, R.M)
     @inbounds for (i, d) in enumerate(R.ds); T[d + 1] = tau[i]; end
     # c_q = sum_d tau_d exp(2i pi d q / M) is M times an inverse transform of tau
-    # placed on the units: O(M log M) instead of the M x N table of exponentials
-    # the direct sum would build -- and it is the SAME for every draw, so the
-    # experiments compute it once and pass it in.
+    # placed on the units.
     return real(R.M .* (HAVE_FFTW ? ifft(T) : R.Wi * T))
 end
 
@@ -727,9 +654,7 @@ end
 """
     noiseless_out(P, mode, imath, fvals, F)
 
-Tr(U* . X^imath v_0): what the chain would output with no noise at all.  Being
-mode-agnostic, it is what makes the error alone measurable for any map f -- the
-message that is subtracted is the message at the rotation actually realised.
+Tr(U* . X^imath v_0): what the chain would output with no noise at all.  
 """
 function noiseless_out(P::Params, mode, imath::Integer, fvals, F)
     R = P.R
@@ -742,8 +667,7 @@ end
 
 The draws 1:nb split into one contiguous block per thread.  The parallel loops
 below run over the blocks rather than over the draws, so that each block builds
-exactly one Workspace and no iteration ever has to ask which thread it is on --
-`threadid()` is not stable under the dynamic scheduler.
+exactly one Workspace and no iteration ever has to ask which thread it is on.
 """
 chunkup(nb::Int) = collect(Iterators.partition(1:nb, max(1, cld(nb, Threads.nthreads()))))
 
@@ -754,8 +678,7 @@ The output error of one mode, nb independent bootstraps.
 
 The nb inputs are drawn FIRST, sequentially, from the single `rng`; only the
 rotations, which do not touch it and do not touch each other, are then run in
-parallel.  The sample is therefore exactly the serial one whatever the number of
-threads -- a run at -t 8 reproduces a run at -t 1 draw by draw.
+parallel.  
 """
 function output_errors(P::Params, mode, nb::Int, rng, K::Key, S, fvals, F;
                        aligned::Bool = true)
@@ -812,12 +735,6 @@ Amplification sigma(E_2)/sigma(E_1) for the five named maps and the two designs
 gamma = 1 and gamma = M Omega*_0, against the prediction ||B_f||_Tr / sqrt(N)
 of the spherical model.  This is Figure 3 of the paper.
 
-Proposition 3 reduces every output error to a linear functional of one and the
-same accumulator error, E = Tr(U* e), and test T2 checks that identity against
-the full pipeline to machine precision.  The measurement is therefore made on
-ONE set of accumulator draws, every design and every map being evaluated on the
-same e -- common random numbers, so that the ratio is estimated far more
-sharply than by running the chains separately.
 """
 function exp_amplification(p::Int, alpha::Int; nb::Int = 8000, n::Int = 256,
                            model::Symbol = :spherical, sig_bk = nothing,
@@ -859,14 +776,7 @@ function exp_amplification(p::Int, alpha::Int; nb::Int = 8000, n::Int = 256,
                                rows[end].margin, rows[end].fails, nb)
         end
     end
-    # What the torus can fold is the ACCUMULATOR, whose monomial coordinates are
-    # reduced by mod1c in accumulator_errors; sigma(E_2) is a linear functional of
-    # those coordinates, formed afterwards and never reduced, so it may exceed 1/2
-    # without any bias at all.  The test is therefore made on E directly, and it
-    # observes rather than models: over nb*N draws, a distribution wide enough to
-    # wrap piles its extremes up against 1/2, so a maximum that stays clear of the
-    # boundary is proof that nothing folded.  sig_bk right at N = 42 is 16 times
-    # too large at N = 2058, sigma growing like sqrt(N n) -- that is the trap.
+    #
     emax = maximum(abs, E)
     emax > 0.45 && @warn @sprintf("the accumulator coordinates reach %.3f of the 1/2 wrap (sig_bk = %.3g): they are folding and every amplification is biased downwards. Lower sig_bk -- 2.0^-30 keeps the maximum near %.2g at N = 2058, n = 512.", emax, sig_bk, 0.05)
     verbose && @printf("  accumulator: sd %.3g, max %.3g of the 1/2 wrap\n", std(E), emax)
@@ -876,11 +786,7 @@ end
 """
     bench(p, alpha; n, ell, nb)
 
-Where the time goes, and how it scales.  The phases are timed SEPARATELY -- the
-ring's N x N algebra, the key setup, and the rotation loop -- because only the
-last is threaded, and a single total hides which of them is being measured.
-Run it at -t 1 and at -t 8: the ratio of the per-rotation figures, and no other,
-is the speed-up of the threading.
+Where the time goes, and how it scales.  
 """
 function bench(p::Int, alpha::Int; n::Int = 512, ell::Int = 6, nb::Int = 32,
                sig_bk = 2.0^-30)
@@ -914,21 +820,12 @@ The key noise that leaves the WORST of the ten amplifications `target_sd`
 standard deviations inside the decoding radius 1/(2p), so that the setting is
 one that actually decrypts.
 
-The accumulator error is the sum of a key term proportional to sig_bk and a
-gadget term proportional to D^-ell; as long as the first dominates -- it does
-here by some five orders of magnitude -- sigma is LINEAR in sig_bk, so one short
-run at a reference noise fixes the constant and the rest is arithmetic.  The
-result is rounded down to a power of two, which can only widen the margin.
 """
 function calibrate_sigbk(p::Int, alpha::Int; n::Int = 512, ell::Int = 6,
                          Dlog::Int = 7, target_sd::Real = 8.0, ref = 2.0^-30,
                          nb::Int = 64, seed::Int = 11)
     local R, s1, emax
-    # The reference run must itself be far from the 1/2 wrap, or the sigma it
-    # reports is a folded, saturated one and the extrapolation below rests on
-    # nothing.  A large (ell, D) split -- (3, 2^14) say -- multiplies sigma by
-    # some sixty at fixed sig_bk and walks straight into that, so the reference
-    # is lowered until the accumulator is demonstrably clear of the boundary.
+    #
     for attempt in 1:12
         P = Params(p, alpha; sig_e = 0.0, sig_bk = ref, Dlog = Dlog, ell = ell, n = n)
         R = P.R
@@ -952,12 +849,10 @@ end
 """
     exp_decrypt(p, alpha; sig_bk, ...)
 
-The end-to-end check: nb complete bootstraps per mode -- blind rotation,
-extraction, decryption under the ring key -- counting how many land outside the
-decoding radius 1/(2p).  Proposition 3 already gives the output error as a
+The end-to-end check: nb complete bootstraps per mode, counting how many land outside the
+decoding radius 1/(2p).  Proposition 3 gives the output error as a
 functional of the accumulator, and `exp_amplification` counts the failures that
-way; this runs the whole chain instead, so that the claim rests on bootstraps
-performed rather than on an identity invoked.
+way; this runs the whole chain instead.
 """
 function exp_decrypt(p::Int, alpha::Int; sig_bk, n::Int = 512, ell::Int = 6,
                      Dlog::Int = 7, nb::Int = 200, seed::Int = 11,
@@ -991,7 +886,7 @@ end
 Empirical covariance G^ of the N dual coordinates of e* = Omega*_0 e, against
 the spherical model G = sigma_c^2 (M I_N - m Pi) = sigma_c^2 Gr(Omega) and
 against the white model G = sigma^2 I_N.  Key regime: sigma_BK > 0 with the
-gadget precision pushed out of the way.  This is Table 1 of the paper.
+gadget precision pushed out of the way.  
 """
 function exp_covariance(p::Int, alpha::Int; nb::Int = 3000, n::Int = 128,
                         model::Symbol = :spherical, sig_bk = nothing,
